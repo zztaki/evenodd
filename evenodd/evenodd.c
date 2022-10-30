@@ -5,21 +5,12 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
-#define MAX_P 10000
-char dirnames[MAX_P + 10][20];
+#define MAX_P 100
+#define MAX_FILE_LENGTH 100
+char dirnames[MAX_P + 10][MAX_FILE_LENGTH + 10]; // 存放目录名（disk_i）或文件名(disk_i/file_name_i)
 int arrays[MAX_P + 10][MAX_P + 10];
-
-// BKDRHash对原文件名进行加密，密文用于数据文件的分块
-unsigned int BKDRHash(char *str) {
-    unsigned int seed = 131; // 31 131 1313 13131 131313 etc..
-    unsigned int hash = 0;
-
-    while (*str) {
-        hash = hash * seed + (*str++);
-    }
-
-    return (hash & 0x7FFFFFFF);
-}
+unsigned char buf[MAX_P + 10][MAX_P + 10]; // p+2个数据块的一列
+unsigned char syndrome;                    // 对角线编号为(p-1)上的数据的异或值
 
 void usage() {
     printf("./evenodd write <file_name> <p>\n");
@@ -27,16 +18,41 @@ void usage() {
     printf("./evenodd repair <number_erasures> <idx0> ...\n");
 }
 
-/*
-Isn't <p>(p >= 2) a prime?
-*/
-int notPrime(int p) {
+// 如果p不是质数返回1，否则返回0
+inline int notPrime(int p) {
     for (int i = 2; i <= sqrt(p); i++) {
         if (p % i == 0) {
             return 1;
         }
     }
     return 0;
+}
+
+// 判断 disk_0, disk_1, ..., disk_<p+1>
+// 是否存在，不存在则需要创建对应文件夹
+inline void createDisk(int p) {
+    for (int i = 0; i < p + 2; i++) {
+        sprintf(dirnames[i], "./disk_%d", i);
+        if (access(dirnames[i], F_OK) == -1) {
+            mkdir(dirnames[i], S_IRWXU);
+        }
+    }
+}
+
+// 设置数据列和校验列
+inline void setBuf(unsigned char *tmp, int p) {
+    syndrome = 0;
+    for (int i = 0; i < p - 1; i++) {
+        syndrome ^= tmp[(p - 1) * (i + 1)];
+        for (int j = 0; j < p; j++) {
+            buf[p][i] ^= tmp[i * p + j];                     // 第i行逐列异或得到第i行的行校验位
+            buf[p + 1][(i + j) % (p - 1)] ^= tmp[i * p + j]; // 逐步得到未与syndrome异或的对角线校验位
+            buf[j][i] = tmp[i * p + j];                      // 数据列
+        }
+    }
+    for (int i = 0; i < p - 1; i++) {
+        buf[p + 1][i] ^= syndrome; // 对角线校验位与syndrome异或
+    }
 }
 
 int main(int argc, char **argv) {
@@ -63,51 +79,39 @@ int main(int argc, char **argv) {
 
         // p should be a prime
         int p = atoi(argv[3]);
-        if (p <= 1 || notPrime(p)) {
+        if (p <= 1 || notPrime(p)) { // 是否需要判定？
             printf("<p>: %d isn't a prime!\n", p);
             return -1;
         }
 
-        // disk_0, disk_1, ..., disk_<p+1> exist?
-        for (int i = 0; i < p + 2; i++) {
-            sprintf(dirnames[i], "./disk_%d", i);
-            if (access(dirnames[i], F_OK) == -1) {
-                mkdir(dirnames[i], S_IRWXU);
-            }
-        }
+        createDisk(p);
 
         // open <file_name>, read from it and write to ./disk_<i>/<filename>_i
         char *file_name = argv[2];
-        FILE *fpr = fopen(file_name, "r");
+        unsigned char tmp[(MAX_P + 10) * MAX_P] = {0};
+        FILE *fpr = fopen(file_name, "r"), *fpw[MAX_P + 10];
+        int cnt; // 实际一次从file_name中读取的长度
 
-        // 添加行校验位以及未与syndrome进行异或的对角线校验位
-        for (int i = 0; i < p - 1; i++) {
-            for (int j = 0; j < p; j++) {
-                fscanf(fpr, "%d", arrays[i][j]);
-                arrays[i][p] ^= arrays[i][j];
-                if (i == (i + j) % p) {
-                    arrays[i][p + 1] ^= arrays[i][j];
-                }
-            }
-        }
-        int syndrome = 0; //对角线编号为(p-1)上的数据的异或值
-        for (int i = 0; i < p - 1; i++) {
-            syndrome ^= arrays[i][p - 1 - i];
-        }
-        // 最后修正对角线校验位
-        for (int i = 0; i < p - 1; i++) {
-            arrays[i][p + 1] ^= syndrome;
-        }
-
-        // 写入数据块
         for (int j = 0; j < p + 2; j++) {
-            char file[100];
-            sprintf(file, "./disk_%d/%s_%d", j, BKDRHash(file_name), j);
-            FILE *fpw = fopen(file, "w+");
-            for (int i = 0; i < p - 1; i++) {
-                fprintf(fpw, "%d ", arrays[i][j]);
+            sprintf(dirnames[j], "./disk_%d/%s_%d", j, file_name, j);
+            fpw[j] = fopen(dirnames[j], "w");
+        }
+
+        // 将源文件进行EVENODD编码
+        while (fread(tmp, sizeof(unsigned char), p * (p - 1), fpr)) {
+            setBuf(tmp, p);
+
+            // 写入磁盘
+            for (int j = 0; j < p + 2; j++) {
+                fwrite(buf[j], sizeof(unsigned char), p - 1, fpw[j]);
+                memset(buf[j], 0, MAX_P + 10);
             }
-            fclose(fpw);
+
+            memset(tmp, 0, (MAX_P + 10) * MAX_P);
+        }
+        fclose(fpr);
+        for (int j = 0; j < p + 2; j++) {
+            fclose(fpw[j]);
         }
 
     } else if (strcmp(op, "read")) {
