@@ -839,6 +839,7 @@ int main(int argc, char **argv) {
         char file_name[MAX_FILE_LENGTH + 10];
         unsigned int hash_name;
         int p;
+        long long int fileSize;
 
         if (failCnt > 2) {
             printf("Too many corruptions!\n");
@@ -858,7 +859,7 @@ int main(int argc, char **argv) {
             }
 
             FILE *fp = fopen("./.meta", "r");
-            while (fscanf(fp, "%s %u %d\n", file_name, &hash_name, &p) != EOF) {
+            while (fscanf(fp, "%s %u %d %lld\n", file_name, &hash_name, &p, &fileSize) != EOF) {
                 if (fail >= p + 2) {
                     continue;
                 } else if (fail == p + 1) {
@@ -898,7 +899,7 @@ int main(int argc, char **argv) {
             }
 
             FILE *fp = fopen("./.meta", "r");
-            while (fscanf(fp, "%s %u %d\n", file_name, &hash_name, &p) != EOF) {
+            while (fscanf(fp, "%s %u %d %lld\n", file_name, &hash_name, &p, &fileSize) != EOF) {
                 if (fail1 >= p + 2) { // 丢失的两个文件夹与file_name无关
                     continue;
                 } else if (fail1 == p + 1) { // 丢失的fail2文件夹与file_name无关，丢失的fail1是file_name的对角线校验块
