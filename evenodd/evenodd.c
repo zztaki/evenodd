@@ -10,7 +10,7 @@
 char dirnames[MAX_P + 10][MAX_FILE_LENGTH + 10]; // 存放目录名（disk_i）或文件名(disk_i/file_name_i)
 unsigned char buf[MAX_P + 10][MAX_P + 10];       // p+2个数据块的一列
 unsigned char syndrome;                          // 对角线编号为(p-1)上的数据的异或值
-int cnt;
+int cnt;                                         // 一次fread读取的大小
 
 // S[i][0]表示缺失的两个数据块的第i行数据的异或值；S[i][1]表示缺失的两个数据块对角线编号为i的数据的异或值
 unsigned char S[MAX_P + 10][2]; // 水平校验子和对角线校验子
@@ -55,9 +55,9 @@ unsigned int BKDRHash(char *str) {
 }
 
 // 创建元数据
-void createMeta(char *filename, unsigned int hashname, int p) {
+void createMeta(char *filename, unsigned int hashname, int p, long long int fileSize) {
     FILE *fp = fopen("./.meta", "a+");
-    fprintf(fp, "%s %u %d\n", filename, hashname, p);
+    fprintf(fp, "%s %u %d %lld\n", filename, hashname, p, fileSize);
     fclose(fp);
 }
 
@@ -86,16 +86,18 @@ void setBuf(unsigned char *tmp, int p) {
 }
 
 // 读文件时，检查.meta中是否有file_name，有则返回1，并且将其hash码和p值保存到指针中；否则返回0
-int checkFileExist(char *file_name, unsigned int *hash_name_point, int *p_point) {
+int checkFileExist(char *file_name, unsigned int *hash_name_point, int *p_point, long long int *fileSize_point) {
     FILE *fp = fopen("./.meta", "r");
     char _file_name[MAX_FILE_LENGTH + 10] = {0};
     unsigned int hash_name;
     int p;
+    long long int fileSize;
 
-    while (fscanf(fp, "%s %u %d\n", _file_name, &hash_name, &p) != EOF) {
+    while (fscanf(fp, "%s %u %d %lld\n", _file_name, &hash_name, &p, &fileSize) != EOF) {
         if (strcmp(file_name, _file_name) == 0) {
             *hash_name_point = hash_name;
             *p_point = p;
+            *fileSize_point = fileSize;
             fclose(fp);
             return 1;
         }
@@ -122,11 +124,16 @@ int getFailCnt(unsigned int hashname, int p, int *a) {
 }
 
 // -------------------------read START------------------------------
-// 读数据时需要注意fwrite末尾是'\0'的情况，会导致save_as文件大小和file_name不一样。因此这里使用strlen
+// 读数据时需要注意fwrite末尾多余'\0'以及原文件内容包含'\0'的情况
 
 // 从前p列读取数据到sava_as中
-void readData(unsigned int hash_name, int p, char *save_as) {
+void readData(unsigned int hash_name, int p, char *save_as, long long int remainSize) {
     FILE *fpw = fopen(save_as, "w"), *fpr[MAX_P + 10];
+    if (remainSize == 0) {
+        fclose(fpw);
+        return;
+    }
+
     for (int j = 0; j < p; j++) {
         sprintf(dirnames[j], "./disk_%d/%u_%d", j, hash_name, j);
         fpr[j] = fopen(dirnames[j], "r");
@@ -135,11 +142,16 @@ void readData(unsigned int hash_name, int p, char *save_as) {
     int flag = 1;
     while (flag) {
         for (int j = 0; j < p; j++) {
-            if (!fread(tmp, sizeof(unsigned char), p - 1, fpr[j])) {
+            fread(tmp, sizeof(unsigned char), p - 1, fpr[j]);
+            if (p - 1 < remainSize) {
+                fwrite(tmp, sizeof(unsigned char), p - 1, fpw);
+                remainSize -= p - 1;
+            } else {
+                fwrite(tmp, sizeof(unsigned char), remainSize, fpw);
+                remainSize = 0;
                 flag = 0;
                 break;
             }
-            fwrite(tmp, sizeof(unsigned char), strlen((const char *)tmp), fpw);
             memset(tmp, 0, MAX_P + 10);
         }
         if (!flag)
@@ -152,8 +164,13 @@ void readData(unsigned int hash_name, int p, char *save_as) {
 }
 
 // 利用行校验列正常读出损坏列
-void readDataByLine(unsigned int hash_name, int fail, int p, char *save_as) {
+void readDataByLine(unsigned int hash_name, int fail, int p, char *save_as, long long int remainSize) {
     FILE *fpw = fopen(save_as, "w"), *fpr[MAX_P + 10];
+    if (remainSize == 0) {
+        fclose(fpw);
+        return;
+    }
+
     for (int j = 0; j < p + 1; j++) {
         if (j != fail) {
             sprintf(dirnames[j], "./disk_%d/%u_%d", j, hash_name, j);
@@ -164,13 +181,11 @@ void readDataByLine(unsigned int hash_name, int fail, int p, char *save_as) {
     int flag = 1;
     while (flag) {
         for (int j = 0; j < p + 1; j++) {
-            if (j != fail && !fread(buf[j], sizeof(unsigned char), p - 1, fpr[j])) { // 读出p-1个数据列以及行校验列
-                flag = 0;
-                break;
+            if (j != fail) { // 读出p-1个数据列以及行校验列
+                fread(buf[j], sizeof(unsigned char), p - 1, fpr[j]);
             }
         }
-        if (!flag)
-            break;
+
         for (int i = 0; i < p - 1; i++) { // 利用异或运算得到第fail数据列
             for (int j = 0; j < p + 1; j++) {
                 if (j != fail) {
@@ -178,11 +193,32 @@ void readDataByLine(unsigned int hash_name, int fail, int p, char *save_as) {
                 }
             }
         }
-        for (int j = 0; j < p; j++) { // 写入sava_as
-            fwrite(buf[j], sizeof(unsigned char), strlen((const char *)buf[j]), fpw);
+
+        if (p * (p - 1) < remainSize) {
+            for (int j = 0; j < p; j++) { // 写入sava_as
+                fwrite(buf[j], sizeof(unsigned char), p - 1, fpw);
+            }
+            remainSize -= p * (p - 1);
+        } else {
+            for (int j = 0; j < p; j++) { // 写入sava_as
+                if (p - 1 < remainSize) {
+                    fwrite(buf[j], sizeof(unsigned char), p - 1, fpw);
+                    remainSize -= p - 1;
+                } else {
+                    fwrite(buf[j], sizeof(unsigned char), remainSize, fpw);
+                    remainSize = 0;
+                    flag = 0;
+                    break;
+                }
+            }
+        }
+
+        for (int j = 0; j < p + 1; j++) {
             memset(buf[j], 0, MAX_P + 10);
         }
-        memset(buf[p], 0, MAX_P + 10);
+
+        if (!flag)
+            break;
     }
     for (int j = 0; j < p + 1; j++) {
         if (j != fail) {
@@ -193,8 +229,13 @@ void readDataByLine(unsigned int hash_name, int fail, int p, char *save_as) {
 }
 
 // 利用对角线校验列正常读出损坏列
-void readDataByDiagonal(unsigned int hash_name, int fail, int p, char *save_as) {
+void readDataByDiagonal(unsigned int hash_name, int fail, int p, char *save_as, long long int remainSize) {
     FILE *fpw = fopen(save_as, "w"), *fpr[MAX_P + 10];
+    if (remainSize == 0) {
+        fclose(fpw);
+        return;
+    }
+
     for (int j = 0; j < p + 2; j++) {
         if (j != fail && j != p) {
             sprintf(dirnames[j], "./disk_%d/%u_%d", j, hash_name, j);
@@ -205,13 +246,10 @@ void readDataByDiagonal(unsigned int hash_name, int fail, int p, char *save_as) 
     int flag = 1;
     while (flag) {
         for (int j = 0; j < p + 2; j++) {
-            if (j != fail && j != p && !fread(buf[j], sizeof(unsigned char), p - 1, fpr[j])) { // 读出p-1个数据列以及行校验列
-                flag = 0;
-                break;
+            if (j != fail && j != p) { // 读出p-1个数据列以及行校验列
+                fread(buf[j], sizeof(unsigned char), p - 1, fpr[j]);
             }
         }
-        if (!flag)
-            break;
 
         // 计算出syndrome
         syndrome = fail - 1 >= 0 ? buf[p + 1][fail - 1] : buf[p + 1][fail - 1 + p];
@@ -231,11 +269,31 @@ void readDataByDiagonal(unsigned int hash_name, int fail, int p, char *save_as) 
             }
         }
 
-        for (int j = 0; j < p; j++) { // 写入sava_as
-            fwrite(buf[j], sizeof(unsigned char), strlen((const char *)buf[j]), fpw);
+        if (p * (p - 1) < remainSize) {
+            for (int j = 0; j < p; j++) { // 写入sava_as
+                fwrite(buf[j], sizeof(unsigned char), p - 1, fpw);
+            }
+            remainSize -= p * (p - 1);
+        } else {
+            for (int j = 0; j < p; j++) {
+                if (p - 1 < remainSize) {
+                    fwrite(buf[j], sizeof(unsigned char), p - 1, fpw);
+                    remainSize -= p - 1;
+                } else {
+                    fwrite(buf[j], sizeof(unsigned char), remainSize, fpw);
+                    remainSize = 0;
+                    flag = 0;
+                    break;
+                }
+            }
+        }
+        for (int j = 0; j < p; j++) {
             memset(buf[j], 0, MAX_P + 10);
         }
         memset(buf[p + 1], 0, MAX_P + 10);
+
+        if (!flag)
+            break;
     }
     for (int j = 0; j < p + 2; j++) {
         if (j != fail && j != p) {
@@ -246,8 +304,13 @@ void readDataByDiagonal(unsigned int hash_name, int fail, int p, char *save_as) 
 }
 
 // 利用行校验列和对角线校验列正常读出两个损坏列
-void readDataByLine_Diagonal(unsigned int hash_name, int fail1, int fail2, int p, char *save_as) {
+void readDataByLine_Diagonal(unsigned int hash_name, int fail1, int fail2, int p, char *save_as, long long int remainSize) {
     FILE *fpw = fopen(save_as, "w"), *fpr[MAX_P + 10];
+    if (remainSize == 0) {
+        fclose(fpw);
+        return;
+    }
+
     for (int j = 0; j < p + 2; j++) {
         if (j != fail1 && j != fail2) {
             sprintf(dirnames[j], "./disk_%d/%u_%d", j, hash_name, j);
@@ -258,13 +321,10 @@ void readDataByLine_Diagonal(unsigned int hash_name, int fail1, int fail2, int p
     int flag = 1;
     while (flag) {
         for (int j = 0; j < p + 2; j++) {
-            if (j != fail1 && j != fail2 && !fread(buf[j], sizeof(unsigned char), p - 1, fpr[j])) { // 读出p-1个数据列以及行校验列
-                flag = 0;
-                break;
+            if (j != fail1 && j != fail2) { // 读出p-1个数据列以及行校验列
+                fread(buf[j], sizeof(unsigned char), p - 1, fpr[j]);
             }
         }
-        if (!flag)
-            break;
 
         // 获得syndrome
         syndrome = 0;
@@ -293,12 +353,31 @@ void readDataByLine_Diagonal(unsigned int hash_name, int fail1, int fail2, int p
             s = s - fail2 + fail1 >= 0 ? s - fail2 + fail1 : s - fail2 + fail1 + p;
         } while (s != p - 1);
 
-        for (int j = 0; j < p; j++) { // 写入sava_as
-            fwrite(buf[j], sizeof(unsigned char), strlen((const char *)buf[j]), fpw);
+        if (p * (p - 1) < remainSize) {
+            for (int j = 0; j < p; j++) { // 写入sava_as
+                fwrite(buf[j], sizeof(unsigned char), p - 1, fpw);
+            }
+            remainSize -= p * (p - 1);
+        } else {
+            for (int j = 0; j < p; j++) {
+                if (p - 1 < remainSize) {
+                    fwrite(buf[j], sizeof(unsigned char), p - 1, fpw);
+                    remainSize -= p - 1;
+                } else {
+                    fwrite(buf[j], sizeof(unsigned char), remainSize, fpw);
+                    remainSize = 0;
+                    flag = 0;
+                    break;
+                }
+            }
+        }
+
+        for (int j = 0; j < p + 2; j++) {
             memset(buf[j], 0, MAX_P + 10);
         }
-        memset(buf[p], 0, MAX_P + 10);
-        memset(buf[p + 1], 0, MAX_P + 10);
+
+        if (!flag)
+            break;
     }
     for (int j = 0; j < p + 2; j++) {
         if (j != fail1 && j != fail2) {
@@ -618,14 +697,8 @@ void repairTwoData(unsigned int hash_name, int fail1, int fail2, int p) {
 }
 
 // -------------------------repair END------------------------------
-// int argc, char **argv
+
 int main(int argc, char **argv) {
-    // int argc = 5;
-    // char argv[5][100] = {"./evenodd",
-    //                      "repair",
-    //                      "2",
-    //                      "5",
-    //                      "6"};
     if (argc < 2) {
         usage();
         return -1;
@@ -647,6 +720,12 @@ int main(int argc, char **argv) {
             return -1;
         }
 
+        char *file_name = argv[2];
+        if (access(file_name, F_OK) == -1) {
+            printf("File does not exist!\n");
+            return -1;
+        }
+
         // p应该是质数
         int p = atoi(argv[3]);
         if (p <= 1 || notPrime(p)) { // 是否需要判定？
@@ -658,9 +737,7 @@ int main(int argc, char **argv) {
         createDisk(p);
 
         // 在.meta文件中追加 file_name hash_name 的映射
-        char *file_name = argv[2];
         unsigned int hash_name = BKDRHash(file_name);
-        createMeta(file_name, hash_name, p);
 
         unsigned char tmp[(MAX_P + 10) * MAX_P] = {0};
         FILE *fpr = fopen(file_name, "r"), *fpw[MAX_P + 10];
@@ -669,10 +746,12 @@ int main(int argc, char **argv) {
             sprintf(dirnames[j], "./disk_%d/%u_%d", j, hash_name, j);
             fpw[j] = fopen(dirnames[j], "w");
         }
+        long long int fileSize = 0;
 
         // 将源文件进行EVENODD编码
-        while (fread(tmp, sizeof(unsigned char), p * (p - 1), fpr)) {
+        while (cnt = fread(tmp, sizeof(unsigned char), p * (p - 1), fpr)) {
             setBuf(tmp, p);
+            fileSize += cnt;
 
             // 写入磁盘
             for (int j = 0; j < p + 2; j++) {
@@ -682,6 +761,8 @@ int main(int argc, char **argv) {
 
             memset(tmp, 0, (MAX_P + 10) * MAX_P); // 通过置零，无需考虑一次fread读取长度小于 p*(p-1) 的情况
         }
+        createMeta(file_name, hash_name, p, fileSize);
+
         fclose(fpr);
         for (int j = 0; j < p + 2; j++) {
             fclose(fpw[j]);
@@ -704,9 +785,10 @@ int main(int argc, char **argv) {
         char *file_name = argv[2], *save_as = argv[3];
         unsigned int hash_name;
         int p;
+        long long int fileSize;
 
         // 检查文件是否存在，若存在一并获得hash_name
-        int file_exist = checkFileExist(file_name, &hash_name, &p);
+        int file_exist = checkFileExist(file_name, &hash_name, &p, &fileSize);
         if (!file_exist) {
             printf("File does not exist!\n");
             return -1;
@@ -715,22 +797,22 @@ int main(int argc, char **argv) {
         int fail[MAX_P + 10]; // 记录缺失的数据块
         int failCnt = getFailCnt(hash_name, p, fail);
         if (failCnt == 0) {
-            readData(hash_name, p, save_as);
+            readData(hash_name, p, save_as, fileSize);
         } else if (failCnt == 1) {
             if (fail[0] >= p) { // 冗余块丢失不影响读
-                readData(hash_name, p, save_as);
+                readData(hash_name, p, save_as, fileSize);
             } else { // 某个数据块丢失，利用行校验位恢复读
-                readDataByLine(hash_name, fail[0], p, save_as);
+                readDataByLine(hash_name, fail[0], p, save_as, fileSize);
             }
         } else if (failCnt == 2) {
             if (fail[0] == p && fail[1] == p + 1) { // 仅冗余块丢失，正常读
-                readData(hash_name, p, save_as);
+                readData(hash_name, p, save_as, fileSize);
             } else if (fail[0] < p && fail[1] == p) {
-                readDataByDiagonal(hash_name, fail[0], p, save_as);
+                readDataByDiagonal(hash_name, fail[0], p, save_as, fileSize);
             } else if (fail[0] < p && fail[1] == p + 1) { // 某个数据块，以及对角线校验列丢失，利用行校验列恢复读
-                readDataByLine(hash_name, fail[0], p, save_as);
+                readDataByLine(hash_name, fail[0], p, save_as, fileSize);
             } else { // 两个数据块丢失
-                readDataByLine_Diagonal(hash_name, fail[0], fail[1], p, save_as);
+                readDataByLine_Diagonal(hash_name, fail[0], fail[1], p, save_as, fileSize);
             }
         } else {
             printf("File corrupted!\n");
